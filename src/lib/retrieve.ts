@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { normalizeText, splitParagraphs, truncate } from "@/lib/format";
+import { debugLog, debugWarn } from "@/lib/debug";
 import type { SourceSnippet } from "@/types";
 
 // Simple keyword-based retrieval (no embeddings) to keep the skeleton lightweight.
@@ -38,6 +39,14 @@ export async function retrieve(query: string, limit = 5): Promise<SourceSnippet[
   const files = await fs.readdir(KNOWLEDGE_DIR);
   const mdFiles = files.filter((file) => file.endsWith(".md"));
   const tokens = tokenize(query);
+  debugLog("retrieve:start", {
+    knowledgeDir: KNOWLEDGE_DIR,
+    filesCount: mdFiles.length,
+    tokens: tokens.slice(0, 10),
+  });
+  if (mdFiles.length === 0) {
+    debugWarn("retrieve:no_files", { knowledgeDir: KNOWLEDGE_DIR });
+  }
   const scored: ScoredParagraph[] = [];
 
   for (const file of mdFiles) {
@@ -62,6 +71,12 @@ export async function retrieve(query: string, limit = 5): Promise<SourceSnippet[
   if (scored.length === 0) return [];
 
   scored.sort((a, b) => b.score - a.score);
+  debugLog("retrieve:top_scores", {
+    top: scored.slice(0, 5).map((item) => ({
+      title: item.title,
+      score: item.score,
+    })),
+  });
 
   const trimmed = scored.slice(0, limit);
   return trimmed.map((item) => ({

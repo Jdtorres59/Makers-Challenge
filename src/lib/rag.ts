@@ -1,5 +1,6 @@
 import { generateJson } from "@/lib/llm";
 import { truncate } from "@/lib/format";
+import { debugLog, debugWarn, redact } from "@/lib/debug";
 import type { ChatMessage, Intent, SourceSnippet } from "@/types";
 
 const MAX_CONTEXT_MESSAGES = 8;
@@ -11,6 +12,7 @@ export type RagResult = {
   shouldOfferDemo?: boolean;
   raw?: string;
   usedFallback?: boolean;
+  fallbackReason?: "missing_key" | "openai_error" | "json_parse" | "no_sources" | "unknown";
 };
 
 function buildConversationContext(messages: ChatMessage[]): string {
@@ -37,8 +39,9 @@ function buildSourcesContext(sources: SourceSnippet[]): string {
 function safeFallback(
   intent: Intent,
   hasSources: boolean,
-  reason: "missing_key" | "llm_error" | "parse_error"
+  reason: RagResult["fallbackReason"] = "unknown"
 ): RagResult {
+  const fallbackReason = reason ?? (hasSources ? "unknown" : "no_sources");
   const reasonLine =
     reason === "missing_key"
       ? "No pude generar una respuesta con IA porque falta configuración del servidor."
@@ -62,11 +65,12 @@ function safeFallback(
     answer: `${reasonLine} ${base} ${extra}`.trim(),
     followUp,
     usedFallback: true,
+    fallbackReason,
     confidence: "low",
   };
 }
 
-function parseJson(content: string): RagResult | null {
+function tryParseJson(content: string): { result: RagResult | null; error?: string } {
   try {
     const parsed = JSON.parse(content) as {
       answer?: string;
@@ -75,17 +79,21 @@ function parseJson(content: string): RagResult | null {
       should_offer_demo?: boolean;
     };
 
-    if (!parsed.answer || typeof parsed.follow_up === "undefined") return null;
+    if (!parsed.answer || typeof parsed.follow_up === "undefined") {
+      return { result: null };
+    }
 
     return {
-      answer: parsed.answer.trim(),
-      followUp: parsed.follow_up ? parsed.follow_up.trim() : null,
-      confidence: parsed.confidence,
-      shouldOfferDemo: parsed.should_offer_demo,
-      raw: content,
+      result: {
+        answer: parsed.answer.trim(),
+        followUp: parsed.follow_up ? parsed.follow_up.trim() : null,
+        confidence: parsed.confidence,
+        shouldOfferDemo: parsed.should_offer_demo,
+        raw: content,
+      },
     };
   } catch (error) {
-    return null;
+    return { result: null, error: (error as Error).message };
   }
 }
 
@@ -102,6 +110,15 @@ export async function generateRagResponse({
 }): Promise<RagResult> {
   const conversation = buildConversationContext(messages);
   const snippets = buildSourcesContext(sources);
+  const queryPreview = redact(query.slice(0, 120));
+  const hasSources = sources.length > 0;
+
+  debugLog("rag:context", {
+    intent,
+    hasSources,
+    sourceCount: sources.length,
+    queryPreview,
+  });
 
   const systemPrompt = [
     "Eres un asistente comercial de Camaral (ventas/soporte).",
@@ -130,25 +147,37 @@ export async function generateRagResponse({
   ].join("\n");
 
   if (!process.env.OPENAI_API_KEY) {
-    console.warn("[rag] missing_api_key");
-    return safeFallback(intent, sources.length > 0, "missing_key");
+    debugWarn("rag:missing_api_key");
+    return safeFallback(intent, hasSources, "missing_key");
   }
 
   let raw = "";
   let parsed: RagResult | null = null;
   let attempt = 0;
+  const modelName = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+  if (process.env.DEBUG_PROMPT === "true") {
+    debugLog("rag:prompt_lengths", {
+      systemPromptLength: systemPrompt.length,
+      userPromptLength: userPrompt.length,
+    });
+  }
 
   while (attempt < 2 && !parsed) {
     attempt += 1;
     try {
-      console.info("[rag] llm_call", {
+      debugLog("rag:llm_call", {
         intent,
         snippetCount: sources.length,
         snippetTitles: sources.map((source) => source.title),
         attempt,
-        hasApiKey: true,
+        callingOpenAI: true,
+        modelName,
+        timeoutMs: undefined,
+        hasKey: true,
       });
       raw = await generateJson({
+        model: modelName,
         messages: [
           { role: "system", content: systemPrompt },
           {
@@ -160,20 +189,40 @@ export async function generateRagResponse({
           },
         ],
       });
-      parsed = parseJson(raw);
+      debugLog("rag:llm_success", {
+        openAISuccess: true,
+        rawType: typeof raw,
+        rawLength: typeof raw === "string" ? raw.length : undefined,
+      });
+      const parsedResult = tryParseJson(raw);
+      parsed = parsedResult.result;
       if (!parsed) {
-        console.warn("[rag] llm_parse_failed", { attempt });
+        debugWarn("rag:parse_failed", {
+          parseJsonFailed: true,
+          attempt,
+          errorMessage: parsedResult.error
+            ? redact(parsedResult.error.slice(0, 200))
+            : "invalid_json_shape",
+        });
       }
     } catch (error) {
-      console.warn("[rag] llm_error", { attempt, message: (error as Error).message });
+      const err = error as { name?: string; message?: string; status?: number; code?: string };
+      debugWarn("rag:llm_error", {
+        openAIError: true,
+        attempt,
+        errorName: err?.name,
+        errorMessage: err?.message ? redact(err.message.slice(0, 200)) : undefined,
+        status: err?.status,
+        code: err?.code,
+      });
       if (attempt >= 2) {
-        return safeFallback(intent, sources.length > 0, "llm_error");
+        return safeFallback(intent, hasSources, "openai_error");
       }
     }
   }
 
   if (!parsed) {
-    return { ...safeFallback(intent, sources.length > 0, "parse_error"), raw };
+    return { ...safeFallback(intent, hasSources, "json_parse"), raw };
   }
 
   return parsed;

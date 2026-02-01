@@ -3,6 +3,7 @@ import { retrieve } from "@/lib/retrieve";
 import { detectIntent, detectIntentWithLLM } from "@/lib/intent";
 import { generateRagResponse } from "@/lib/rag";
 import { links } from "@/constants/links";
+import { debugLog, isDebug, redact } from "@/lib/debug";
 import type { ChatMessage, ChatResponse, CtaChip, Intent } from "@/types";
 
 export const runtime = "nodejs";
@@ -55,11 +56,15 @@ export async function POST(request: Request) {
     [...messages]
       .reverse()
       .find((message) => message.role === "user")?.content || "";
+  const locale = typeof body.locale === "string" ? body.locale : undefined;
   const requestId = `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
-  console.info("[chat]", requestId, "query", {
-    query,
+  debugLog("chat:request", {
+    requestId,
     messageCount: messages.length,
+    queryLength: query.length,
+    queryPreview: redact(query.slice(0, 120)),
+    locale,
   });
 
   let sources: ChatResponse["sources"] = [];
@@ -68,14 +73,20 @@ export async function POST(request: Request) {
   } catch (error) {
     sources = [];
   }
-  console.info("[chat]", requestId, "snippets", {
-    count: sources.length,
-    titles: sources.map((source) => source.title),
+  debugLog("chat:snippets", {
+    requestId,
+    snippetCount: sources.length,
+    snippets: sources.slice(0, 5).map((source) => ({
+      title: source.title,
+      file: source.file,
+      excerptPreview: redact(source.excerpt.slice(0, 120)),
+    })),
   });
   const ruleIntent = detectIntent(query);
   const llmIntent = ruleIntent === "general" ? await detectIntentWithLLM(query) : null;
   const intent = llmIntent ?? ruleIntent;
-  console.info("[chat]", requestId, "intent", {
+  debugLog("chat:intent", {
+    requestId,
     ruleIntent,
     llmIntent,
     finalIntent: intent,
@@ -86,19 +97,34 @@ export async function POST(request: Request) {
     intent,
     sources,
   });
-  console.info("[chat]", requestId, "rag", {
-    hasAnswer: Boolean(rag.answer),
-    hasFollowUp: Boolean(rag.followUp),
-    confidence: rag.confidence,
+  debugLog("chat:response", {
+    requestId,
+    assistantTextLength: rag.answer.length,
     usedFallback: Boolean(rag.usedFallback),
+    fallbackReason: rag.fallbackReason,
+    confidence: rag.confidence,
   });
   const assistantText = rag.answer;
   const ctaChips = buildCtaChips(intent);
 
-  return NextResponse.json({
+  const response: ChatResponse & {
+    debug?: {
+      usedFallback: boolean;
+      fallbackReason?: string;
+    };
+  } = {
     assistantText,
     sources,
     intent,
     ctaChips,
-  });
+  };
+
+  if (isDebug()) {
+    response.debug = {
+      usedFallback: Boolean(rag.usedFallback),
+      fallbackReason: rag.fallbackReason,
+    };
+  }
+
+  return NextResponse.json(response);
 }
