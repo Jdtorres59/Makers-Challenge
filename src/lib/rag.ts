@@ -116,12 +116,12 @@ export async function generateRagResponse({
     query,
   ].join("\n");
 
-  let raw = \"\";
+  let raw = "";
   try {
     raw = await generateJson({
       messages: [
-        { role: \"system\", content: systemPrompt },
-        { role: \"user\", content: userPrompt },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
       ],
     });
   } catch (error) {
