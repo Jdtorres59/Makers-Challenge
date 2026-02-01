@@ -6,10 +6,11 @@ const MAX_CONTEXT_MESSAGES = 8;
 
 export type RagResult = {
   answer: string;
-  followUp: string;
-  confidence?: number;
+  followUp: string | null;
+  confidence?: "high" | "medium" | "low";
   shouldOfferDemo?: boolean;
   raw?: string;
+  usedFallback?: boolean;
 };
 
 function buildConversationContext(messages: ChatMessage[]): string {
@@ -33,7 +34,16 @@ function buildSourcesContext(sources: SourceSnippet[]): string {
     .join("\n\n");
 }
 
-function safeFallback(intent: Intent, hasSources: boolean): RagResult {
+function safeFallback(
+  intent: Intent,
+  hasSources: boolean,
+  reason: "missing_key" | "llm_error" | "parse_error"
+): RagResult {
+  const reasonLine =
+    reason === "missing_key"
+      ? "No pude generar una respuesta con IA porque falta configuración del servidor."
+      : "No pude generar una respuesta con IA por un error temporal.";
+
   const base =
     intent === "pricing"
       ? "Los planes existen, pero el detalle exacto varía; puedo llevarte a la página oficial o ayudarte a agendar una demo."
@@ -49,8 +59,10 @@ function safeFallback(intent: Intent, hasSources: boolean): RagResult {
     : "No tengo ese detalle confirmado todavía.";
 
   return {
-    answer: `${base} ${extra}`.trim(),
+    answer: `${reasonLine} ${base} ${extra}`.trim(),
     followUp,
+    usedFallback: true,
+    confidence: "low",
   };
 }
 
@@ -58,16 +70,16 @@ function parseJson(content: string): RagResult | null {
   try {
     const parsed = JSON.parse(content) as {
       answer?: string;
-      follow_up?: string;
-      confidence?: number;
+      follow_up?: string | null;
+      confidence?: "high" | "medium" | "low";
       should_offer_demo?: boolean;
     };
 
-    if (!parsed.answer || !parsed.follow_up) return null;
+    if (!parsed.answer || typeof parsed.follow_up === "undefined") return null;
 
     return {
       answer: parsed.answer.trim(),
-      followUp: parsed.follow_up.trim(),
+      followUp: parsed.follow_up ? parsed.follow_up.trim() : null,
       confidence: parsed.confidence,
       shouldOfferDemo: parsed.should_offer_demo,
       raw: content,
@@ -104,6 +116,7 @@ export async function generateRagResponse({
     "Si el intent es demo, confirma y empuja CTA.",
     "Si el intent es objections, responde con empatía y lo disponible en snippets.",
     "Responde con JSON estricto con las claves: answer, follow_up, confidence, should_offer_demo.",
+    "confidence debe ser uno de: high, medium, low.",
   ].join(" ");
 
   const userPrompt = [
@@ -116,21 +129,51 @@ export async function generateRagResponse({
     query,
   ].join("\n");
 
-  let raw = "";
-  try {
-    raw = await generateJson({
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-    });
-  } catch (error) {
-    return safeFallback(intent, sources.length > 0);
+  if (!process.env.OPENAI_API_KEY) {
+    console.warn("[rag] missing_api_key");
+    return safeFallback(intent, sources.length > 0, "missing_key");
   }
 
-  const parsed = parseJson(raw);
+  let raw = "";
+  let parsed: RagResult | null = null;
+  let attempt = 0;
+
+  while (attempt < 2 && !parsed) {
+    attempt += 1;
+    try {
+      console.info("[rag] llm_call", {
+        intent,
+        snippetCount: sources.length,
+        snippetTitles: sources.map((source) => source.title),
+        attempt,
+        hasApiKey: true,
+      });
+      raw = await generateJson({
+        messages: [
+          { role: "system", content: systemPrompt },
+          {
+            role: "user",
+            content:
+              attempt === 2
+                ? `${userPrompt}\n\nIMPORTANTE: responde SOLO con JSON válido.`
+                : userPrompt,
+          },
+        ],
+      });
+      parsed = parseJson(raw);
+      if (!parsed) {
+        console.warn("[rag] llm_parse_failed", { attempt });
+      }
+    } catch (error) {
+      console.warn("[rag] llm_error", { attempt, message: (error as Error).message });
+      if (attempt >= 2) {
+        return safeFallback(intent, sources.length > 0, "llm_error");
+      }
+    }
+  }
+
   if (!parsed) {
-    return { ...safeFallback(intent, sources.length > 0), raw };
+    return { ...safeFallback(intent, sources.length > 0, "parse_error"), raw };
   }
 
   return parsed;

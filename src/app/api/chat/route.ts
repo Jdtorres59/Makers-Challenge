@@ -48,10 +48,6 @@ function buildCtaChips(intent: Intent): CtaChip[] {
   }
 }
 
-function buildAssistantText(answer: string, followUp?: string) {
-  return followUp ? `${answer}\n\n${followUp}` : answer;
-}
-
 export async function POST(request: Request) {
   const body = await request.json().catch(() => ({}) as Record<string, unknown>);
   const messages = Array.isArray(body.messages) ? (body.messages as ChatMessage[]) : [];
@@ -59,6 +55,12 @@ export async function POST(request: Request) {
     [...messages]
       .reverse()
       .find((message) => message.role === "user")?.content || "";
+  const requestId = `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+
+  console.info("[chat]", requestId, "query", {
+    query,
+    messageCount: messages.length,
+  });
 
   let sources: ChatResponse["sources"] = [];
   try {
@@ -66,16 +68,31 @@ export async function POST(request: Request) {
   } catch (error) {
     sources = [];
   }
+  console.info("[chat]", requestId, "snippets", {
+    count: sources.length,
+    titles: sources.map((source) => source.title),
+  });
   const ruleIntent = detectIntent(query);
   const llmIntent = ruleIntent === "general" ? await detectIntentWithLLM(query) : null;
   const intent = llmIntent ?? ruleIntent;
+  console.info("[chat]", requestId, "intent", {
+    ruleIntent,
+    llmIntent,
+    finalIntent: intent,
+  });
   const rag = await generateRagResponse({
     query,
     messages,
     intent,
     sources,
   });
-  const assistantText = buildAssistantText(rag.answer, rag.followUp);
+  console.info("[chat]", requestId, "rag", {
+    hasAnswer: Boolean(rag.answer),
+    hasFollowUp: Boolean(rag.followUp),
+    confidence: rag.confidence,
+    usedFallback: Boolean(rag.usedFallback),
+  });
+  const assistantText = rag.answer;
   const ctaChips = buildCtaChips(intent);
 
   return NextResponse.json({
