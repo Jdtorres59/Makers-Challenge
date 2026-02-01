@@ -1,12 +1,46 @@
 import { NextResponse } from "next/server";
+import fs from "fs/promises";
+import path from "path";
 import { retrieve } from "@/lib/retrieve";
 import { detectIntent, detectIntentWithLLM } from "@/lib/intent";
 import { generateRagResponse } from "@/lib/rag";
 import { links } from "@/constants/links";
 import { debugLog, isDebug, redact } from "@/lib/debug";
+import { splitParagraphs, truncate } from "@/lib/format";
 import type { ChatMessage, ChatResponse, CtaChip, Intent } from "@/types";
 
 export const runtime = "nodejs";
+const KNOWLEDGE_DIR = path.join(process.cwd(), "src", "knowledge");
+const PRICING_FILE = "camaral_pricing.md";
+
+async function loadPricingSnippets(limit = 2): Promise<ChatResponse["sources"]> {
+  try {
+    const filePath = path.join(KNOWLEDGE_DIR, PRICING_FILE);
+    const content = await fs.readFile(filePath, "utf8");
+    const title = content.match(/^#\s+(.+)$/m)?.[1]?.trim() || "Camaral pricing";
+    const paragraphs = splitParagraphs(content.replace(/^#.+$/gm, ""));
+    const prioritized = paragraphs.filter((paragraph) => paragraph.includes("$"));
+    const selected = (prioritized.length > 0 ? prioritized : paragraphs).slice(0, limit);
+
+    return selected.map((paragraph) => ({
+      title,
+      excerpt: truncate(paragraph),
+      file: PRICING_FILE,
+    }));
+  } catch (error) {
+    return [];
+  }
+}
+
+async function ensurePricingSources(
+  sources: ChatResponse["sources"],
+  limit: number
+): Promise<ChatResponse["sources"]> {
+  if (sources.some((source) => source.file === PRICING_FILE)) return sources;
+  const pricingSnippets = await loadPricingSnippets(2);
+  if (pricingSnippets.length === 0) return sources;
+  return [...pricingSnippets, ...sources].slice(0, limit);
+}
 
 function buildCtaChips(intent: Intent): CtaChip[] {
   switch (intent) {
@@ -67,11 +101,23 @@ export async function POST(request: Request) {
     locale,
   });
 
+  const ruleIntent = detectIntent(query);
+  const llmIntent = ruleIntent === "general" ? await detectIntentWithLLM(query) : null;
+  const intent = llmIntent ?? ruleIntent;
+  debugLog("chat:intent", {
+    requestId,
+    ruleIntent,
+    llmIntent,
+    finalIntent: intent,
+  });
   let sources: ChatResponse["sources"] = [];
   try {
     sources = await retrieve(query, 5);
   } catch (error) {
     sources = [];
+  }
+  if (intent === "pricing") {
+    sources = await ensurePricingSources(sources, 5);
   }
   debugLog("chat:snippets", {
     requestId,
@@ -81,15 +127,6 @@ export async function POST(request: Request) {
       file: source.file,
       excerptPreview: redact(source.excerpt.slice(0, 120)),
     })),
-  });
-  const ruleIntent = detectIntent(query);
-  const llmIntent = ruleIntent === "general" ? await detectIntentWithLLM(query) : null;
-  const intent = llmIntent ?? ruleIntent;
-  debugLog("chat:intent", {
-    requestId,
-    ruleIntent,
-    llmIntent,
-    finalIntent: intent,
   });
   const rag = await generateRagResponse({
     query,
